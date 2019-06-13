@@ -27,7 +27,7 @@ import java.nio.charset.Charset;
  * @since 2018/4/18
  */
 public class GatewayOptions {
-    public static final Charset GATEWAY_OPTION_CHARSET = Charset.forName("GBK");
+    public static final Charset GATEWAY_OPTION_CHARSET = Charset.forName("UTF-8");
     public static final Signal GATEWAY_OPTION_SERVICE_ACCESS_ERROR = Signal.valueOf("[NettyGateway]:Access gateway fail!");
     public static final Signal GATEWAY_OPTION_TASK_POST_ERROR = Signal.valueOf("[NettyGateway]:Http post fail!");
     public static final int GATEWAY_OPTION_PARALLEL = Math.max(2, Runtime.getRuntime().availableProcessors());

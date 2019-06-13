@@ -15,6 +15,8 @@
  */
 package com.newlandframework.gateway.netty;
 
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONObject;
 import com.newlandframework.gateway.commons.GatewayAttribute;
 import com.newlandframework.gateway.commons.HttpClientUtils;
 import com.newlandframework.gateway.commons.RouteAttribute;
@@ -29,8 +31,24 @@ import io.netty.util.Signal;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.GlobalEventExecutor;
+import org.apache.http.Header;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpException;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.impl.io.DefaultHttpResponseParser;
+import org.apache.http.impl.io.HttpTransportMetricsImpl;
+import org.apache.http.impl.io.SessionInputBufferImpl;
+import org.apache.http.message.BasicLineParser;
+import org.apache.http.message.LineParser;
+import org.apache.http.util.EntityUtils;
 import org.springframework.util.StringUtils;
 
+import javax.script.Invocable;
+import javax.script.ScriptEngine;
+import javax.script.ScriptEngineManager;
+import javax.script.ScriptException;
+import java.io.*;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -50,10 +68,10 @@ import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
  */
 public class GatewayServerHandler extends SimpleChannelInboundHandler<Object> {
     private HttpRequest request;
-    private StringBuilder buffer = new StringBuilder();
+    private ByteArrayOutputStream buffer = null;
     private String url = "";
     private String uri = "";
-    private StringBuilder respone;
+    private HttpClientUtils.ParsedHttpResp respone;
     private GlobalEventExecutor executor = GlobalEventExecutor.INSTANCE;
     private CountDownLatch latch = new CountDownLatch(1);
 
@@ -71,7 +89,7 @@ public class GatewayServerHandler extends SimpleChannelInboundHandler<Object> {
                 notify100Continue(ctx);
             }
 
-            buffer.setLength(0);
+            buffer = new ByteArrayOutputStream();
             uri = request.uri().substring(1);
         }
 
@@ -79,42 +97,109 @@ public class GatewayServerHandler extends SimpleChannelInboundHandler<Object> {
             HttpContent httpContent = (HttpContent) msg;
             ByteBuf content = httpContent.content();
             if (content.isReadable()) {
-                buffer.append(content.toString(GATEWAY_OPTION_CHARSET));
+                byte[] bytes = new byte[content.readableBytes()];
+                content.getBytes(content.readerIndex(), bytes);
+                try {
+                    buffer.write(bytes);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
 
             if (msg instanceof LastHttpContent) {
                 LastHttpContent trace = (LastHttpContent) msg;
 
-                System.out.println("[NETTY-GATEWAY] REQUEST : " + buffer.toString());
-
                 url = matchUrl();
-                System.out.println("[NETTY-GATEWAY] URL : " + url);
 
-                Future<StringBuilder> future = executor.submit(new Callable<StringBuilder>() {
-                    @Override
-                    public StringBuilder call() {
-                        return HttpClientUtils.post(url, buffer.toString(), GATEWAY_OPTION_HTTP_POST);
+                boolean direct = false;
+                if(uri.startsWith("uiconfig")) {
+                    try {
+                        buffer.write(getUiConfig().getBytes("utf-8"));
+                    } catch (IOException e) {
+                        e.printStackTrace();
                     }
-                });
+                    direct = true;
+                } else if(uri.startsWith("menuconfig")) {
+                    try {
+                        buffer.write(getMenuConfig().getBytes("utf-8"));
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                    direct = true;
+                }
 
-                future.addListener(new FutureListener<StringBuilder>() {
-                    @Override
-                    public void operationComplete(Future<StringBuilder> future) throws Exception {
-                        if (future.isSuccess()) {
-                            respone = ((StringBuilder) future.get(GATEWAY_OPTION_HTTP_POST, TimeUnit.MILLISECONDS));
-                        } else {
-                            respone = new StringBuilder(((Signal) future.cause()).name());
+                if(direct) {
+                    writeRawResponse(buffer.toByteArray(), trace, ctx);
+                }
+                else if(request.method().name().equals("GET")) {
+                    Future<HttpClientUtils.ParsedHttpResp> future =
+                            executor.submit(new Callable<HttpClientUtils.ParsedHttpResp>() {
+                                @Override
+                                public HttpClientUtils.ParsedHttpResp call() {
+                                    try {
+                                        return HttpClientUtils.get("http://localhost:9092/" + uri, request);
+                                    } catch (Exception e) {
+                                        e.printStackTrace();
+                                        throw new RuntimeException("");
+                                    }
+                                }
+                            });
+
+                    future.addListener(new FutureListener<HttpClientUtils.ParsedHttpResp>() {
+                        @Override
+                        public void operationComplete(Future<HttpClientUtils.ParsedHttpResp> future) throws Exception {
+                            if (future.isSuccess()) {
+                                respone = ((HttpClientUtils.ParsedHttpResp)
+                                        future.get(GATEWAY_OPTION_HTTP_POST, TimeUnit.MILLISECONDS));
+                            } else {
+                                respone = null;
+                            }
+                            latch.countDown();
                         }
-                        latch.countDown();
-                    }
-                });
+                    });
 
-                try {
-                    latch.await();
-                    writeResponse(respone, future.isSuccess() ? trace : null, ctx);
-                    ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
+                    try {
+                        latch.await();
+                        writeResponse(respone, future.isSuccess() ? trace : null, ctx);
+                        ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+                else {
+                    Future<HttpClientUtils.ParsedHttpResp> future =
+                            executor.submit(new Callable<HttpClientUtils.ParsedHttpResp>() {
+                        @Override
+                        public HttpClientUtils.ParsedHttpResp call() {
+                            try {
+                                return HttpClientUtils.postJson(url + uri.replace("api/", "/"), request, buffer.toByteArray());
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                                throw new RuntimeException("");
+                            }
+                        }
+                    });
+
+                    future.addListener(new FutureListener<HttpClientUtils.ParsedHttpResp>() {
+                        @Override
+                        public void operationComplete(Future<HttpClientUtils.ParsedHttpResp> future) throws Exception {
+                            if (future.isSuccess()) {
+                                respone = ((HttpClientUtils.ParsedHttpResp)
+                                        future.get(GATEWAY_OPTION_HTTP_POST, TimeUnit.MILLISECONDS));
+                            } else {
+                                respone = null;
+                            }
+                            latch.countDown();
+                        }
+                    });
+
+                    try {
+                        latch.await();
+                        writeResponse(respone, future.isSuccess() ? trace : null, ctx);
+                        ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
                 }
             }
         }
@@ -127,46 +212,83 @@ public class GatewayServerHandler extends SimpleChannelInboundHandler<Object> {
     }
 
     private String matchUrl() {
-        for (GatewayAttribute gateway : RoutingLoader.GATEWAYS) {
-            if (gateway.getServerPath().equals(uri)) {
-                for (RouteAttribute route : RoutingLoader.ROUTERS) {
-                    if (route.getServerPath().equals(uri)) {
-                        String[] keys = StringUtils.delimitedListToStringArray(route.getKeyWord(), GATEWAY_OPTION_KEY_WORD_SPLIT);
-                        boolean match = true;
-                        for (String key : keys) {
-                            if (key.isEmpty()) continue;
-                            if (buffer.toString().indexOf(key.trim()) == -1) {
-                                match = false;
-                                break;
-                            }
-                        }
-                        if (match) {
-                            return route.getMatchAddr();
-                        }
-                    }
-                }
+        if(uri.startsWith("api/authority")) {
+            return "http://192.168.140.100:8080";
+        } else if(uri.startsWith("api/topology")) {
+            return "http://127.0.0.1:9010";
 
-                return gateway.getDefaultAddr();
-            }
+        } else if(uri.startsWith("api/monitor")) {
+            return "http://127.0.0.1:9011";
         }
-        return GATEWAY_OPTION_LOCALHOST;
+        return "";
     }
 
-    private void writeResponse(StringBuilder respone, HttpObject current, ChannelHandlerContext ctx) {
+    private void writeRawResponse(byte[] json,
+                               HttpObject current,
+                               ChannelHandlerContext ctx) {
+            FullHttpResponse response = new DefaultFullHttpResponse(
+                    HTTP_1_1,
+                    OK,
+                    Unpooled.wrappedBuffer(json));
+
+
+            response.headers().set("Access-Control-Allow-Origin", "*");
+            response.headers().set("Access-Control-Allow-Credentials", "true");
+            response.headers().set("Content-Type", "application/json");
+            response.headers().set("Content-Length", json.length);
+            ctx.writeAndFlush(response);
+    }
+
+    private void simpleGet(){
+
+    }
+
+    private void writeResponse(HttpClientUtils.ParsedHttpResp respone,
+                               HttpObject current,
+                               ChannelHandlerContext ctx) {
         if (respone != null) {
-            boolean keepAlive = HttpUtil.isKeepAlive(request);
+//            boolean keepAlive = HttpUtil.isKeepAlive(request);
+
 
             FullHttpResponse response = new DefaultFullHttpResponse(
-                    HTTP_1_1, current == null ? OK : current.decoderResult().isSuccess() ? OK : BAD_REQUEST,
-                    Unpooled.copiedBuffer(respone.toString(), GATEWAY_OPTION_CHARSET));
+                    HTTP_1_1,
+                    current == null ? OK : current.decoderResult().isSuccess() ? OK : BAD_REQUEST,
+                    Unpooled.wrappedBuffer(respone.body));
 
-            response.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; charset=GBK");
+            if(respone.headers != null) {
+                for (Header header : respone.headers) {
+                    response.headers().set(header.getName(), header.getValue());
+                }
+            }
+            response.headers().set("Access-Control-Allow-Origin", "*");
+            response.headers().set("Access-Control-Allow-Credentials", "true");
 
-            if (keepAlive) {
-                response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
-                response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
+            if(uri.endsWith("/user/login")) {
+                String jsonResp = null;
+                try {
+                    jsonResp = new String(respone.body, "UTF-8");
+                } catch (UnsupportedEncodingException e) {
+                    e.printStackTrace();
+                }
+                JSONObject map = JSON.parseObject(jsonResp);
+                if(map.getInteger("ret_code") == 0) {
+                    response.headers().set("Set-Cookie",
+                            "mycookie=cookie_value; Path=/; httpOnly=true");
+                } else {
+                    response.headers().set("Set-Cookie",
+                            "mycookie=; Path=/; httpOnly=true");
+                }
+            } else {
             }
 
+//            response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, resStr.length());
+
+
+            /*
+            if (keepAlive) {
+                response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
+            }
+            */
             ctx.write(response);
         }
     }
@@ -174,6 +296,44 @@ public class GatewayServerHandler extends SimpleChannelInboundHandler<Object> {
     private static void notify100Continue(ChannelHandlerContext ctx) {
         FullHttpResponse response = new DefaultFullHttpResponse(HTTP_1_1, CONTINUE);
         ctx.write(response);
+    }
+
+    private String getUiConfig() {
+        ScriptEngine engine = new ScriptEngineManager().getEngineByName("nashorn");
+        try {
+            engine.eval(new FileReader("config.js"));
+            Invocable invocable = (Invocable) engine;
+
+            Object result = invocable.invokeFunction("getUiConfig");
+            System.out.println(result);
+            return result.toString();
+        } catch (ScriptException e) {
+            e.printStackTrace();
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        } catch (NoSuchMethodException e) {
+            e.printStackTrace();
+        }
+        return "";
+    }
+
+    private String getMenuConfig() {
+        ScriptEngine engine = new ScriptEngineManager().getEngineByName("nashorn");
+        try {
+            engine.eval(new FileReader("config.js"));
+            Invocable invocable = (Invocable) engine;
+
+            Object result = invocable.invokeFunction("getMenuConfig");
+            System.out.println(result);
+            return result.toString();
+        } catch (ScriptException e) {
+            e.printStackTrace();
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        } catch (NoSuchMethodException e) {
+            e.printStackTrace();
+        }
+        return "";
     }
 }
 
